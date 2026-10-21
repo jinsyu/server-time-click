@@ -1,0 +1,96 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  test-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - run: go vet ./internal/...
+      - run: go test -short -count=1 -v ./internal/...
+
+  macos:
+    runs-on: macos-latest
+    env:
+      CGO_ENABLED: '1'
+      MACOSX_DEPLOYMENT_TARGET: '11.0'
+      APP: build/ServerTimeClick.app
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - run: go vet ./...
+      - run: go test -short -count=1 -v ./internal/...
+
+      - name: Korean fonts the app looks for
+        run: ls -l "/System/Library/Fonts/Supplemental/AppleGothic.ttf" "/Library/Fonts/Arial Unicode.ttf"
+
+      - name: Build universal binary (Apple Silicon + Intel)
+        run: |
+          mkdir -p build
+          GOARCH=arm64 go build -trimpath -ldflags "-s -w" -o build/servertime-arm64 .
+          GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o build/servertime-amd64 .
+          lipo -create -output build/servertime build/servertime-arm64 build/servertime-amd64
+          lipo -info build/servertime
+
+      - name: Make .app bundle
+        run: |
+          mkdir -p "$APP/Contents/MacOS"
+          cp build/servertime "$APP/Contents/MacOS/servertime"
+          cat > "$APP/Contents/Info.plist" <<'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key><string>ServerTimeClick</string>
+            <key>CFBundleDisplayName</key><string>서버 시각 클릭</string>
+            <key>CFBundleIdentifier</key><string>io.github.jinsyu.servertime</string>
+            <key>CFBundleExecutable</key><string>servertime</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleShortVersionString</key><string>${{ github.ref_type == 'tag' && github.ref_name || '0.0.0' }}</string>
+            <key>CFBundleVersion</key><string>${{ github.run_number }}</string>
+            <key>LSMinimumSystemVersion</key><string>11.0</string>
+            <key>NSHighResolutionCapable</key><true/>
+          </dict>
+          </plist>
+          EOF
+          plutil -lint "$APP/Contents/Info.plist"
+          codesign --force --deep --sign - "$APP"
+          codesign --verify --verbose "$APP"
+          ditto -c -k --keepParent "$APP" build/ServerTimeClick-macos.zip
+
+      - name: Smoke test (starts, syncs, stays up) and screenshot
+        run: |
+          "$APP/Contents/MacOS/servertime" > build/run.log 2>&1 &
+          pid=$!
+          sleep 20
+          screencapture -x build/screenshot.png || true
+          kill -0 $pid
+          kill $pid
+          cat build/run.log
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: |
+            build/ServerTimeClick-macos.zip
+            build/screenshot.png
+
+      - name: Attach to release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ github.ref_name }}" build/ServerTimeClick-macos.zip --clobber
