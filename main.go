@@ -131,7 +131,7 @@ func newUI() *ui {
 	})
 	u.targetLabel = widget.NewLabel("")
 	u.delayEntry = widget.NewEntry()
-	u.delayEntry.SetText("0")
+	u.delayEntry.SetText("50") // the button usually switches a moment after the open time
 	u.delayEntry.Validator = func(s string) error {
 		if _, err := parseDelay(s); err != nil {
 			return err
