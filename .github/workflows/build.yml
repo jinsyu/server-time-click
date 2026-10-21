@@ -78,16 +78,21 @@ jobs:
           pid=$!
           sleep 20
           screencapture -x build/screenshot.png || true
-          kill -0 $pid
-          kill $pid
+          alive=0
+          kill -0 $pid 2>/dev/null && alive=1 && kill $pid
+          echo "---- app log ----"
           cat build/run.log
+          ls -t ~/Library/Logs/DiagnosticReports 2>/dev/null | head -3
+          [ $alive = 1 ]
 
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: macos
           path: |
             build/ServerTimeClick-macos.zip
             build/screenshot.png
+            build/run.log
 
       - name: Attach to release
         if: github.ref_type == 'tag'
