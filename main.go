@@ -49,12 +49,15 @@ func (t koreanTheme) Font(s fyne.TextStyle) fyne.Resource {
 var red = color.NRGBA{R: 0xE5, G: 0x39, B: 0x35, A: 0xFF}
 
 type ui struct {
-	urlEntry, targetEntry, delayEntry *widget.Entry
-	clickCheck                        *widget.Check
-	syncBtn, armBtn                   *widget.Button
-	clockText, countText              *canvas.Text
-	infoLabel, logLabel               *widget.Label
-	logScroll                         *container.Scroll
+	urlEntry, delayEntry     *widget.Entry
+	hourSel, minSel, secSel  *widget.Select
+	nextHourBtn, practiceBtn *widget.Button
+	targetLabel              *widget.Label
+	clickCheck               *widget.Check
+	syncBtn, armBtn          *widget.Button
+	clockText, countText     *canvas.Text
+	infoLabel, logLabel      *widget.Label
+	logScroll                *container.Scroll
 
 	mu        sync.Mutex
 	clock     *clock.Clock
@@ -72,16 +75,11 @@ type ui struct {
 func main() {
 	platformInit()
 	a := app.NewWithID("io.github.jinsyu.servertime")
-	for _, p := range koreanFonts {
-		if b, err := os.ReadFile(p); err == nil {
-			a.Settings().SetTheme(koreanTheme{theme.DefaultTheme(), fyne.NewStaticResource(filepath.Base(p), b)})
-			break
-		}
-	}
+	useKoreanFont(a)
 	w := a.NewWindow("서버 시각 클릭")
 	u := newUI()
 	w.SetContent(u.layout())
-	w.Resize(fyne.NewSize(460, 620))
+	w.Resize(fyne.NewSize(460, 680))
 
 	go func() {
 		for range time.Tick(20 * time.Millisecond) {
@@ -92,14 +90,54 @@ func main() {
 	w.ShowAndRun()
 }
 
+// useKoreanFont sets the first system font with Hangul as the UI font and
+// reports which one it used ("" if none was found).
+func useKoreanFont(a fyne.App) string {
+	for _, p := range koreanFonts {
+		if b, err := os.ReadFile(p); err == nil {
+			a.Settings().SetTheme(koreanTheme{theme.DefaultTheme(), fyne.NewStaticResource(filepath.Base(p), b)})
+			return p
+		}
+	}
+	return ""
+}
+
+// twoDigits returns "00", "01", ... up to n-1.
+func twoDigits(n int) []string {
+	s := make([]string, n)
+	for i := range s {
+		s[i] = fmt.Sprintf("%02d", i)
+	}
+	return s
+}
+
 func newUI() *ui {
 	u := &ui{}
 	u.urlEntry = widget.NewEntry()
 	u.urlEntry.SetText(clock.DefaultURL)
-	u.targetEntry = widget.NewEntry()
-	u.targetEntry.SetPlaceHolder("16:00:00")
+	u.hourSel = widget.NewSelect(twoDigits(24), nil)
+	u.minSel = widget.NewSelect(twoDigits(60), nil)
+	u.secSel = widget.NewSelect(twoDigits(60), nil)
+	// The default "(Select one)" placeholder sets each dropdown's minimum width.
+	u.hourSel.PlaceHolder, u.minSel.PlaceHolder, u.secSel.PlaceHolder = "시", "분", "초"
+	u.setTarget(math.Floor(clock.Now()/3600)*3600 + 3600) // next full hour
+	u.nextHourBtn = widget.NewButton("다음 정각", func() {
+		serverNow := u.serverNow()
+		u.setTarget(math.Floor(serverNow/3600)*3600 + 3600)
+	})
+	u.practiceBtn = widget.NewButton("연습: 1~2분 뒤", func() {
+		serverNow := u.serverNow()
+		u.setTarget(math.Ceil(serverNow/60)*60 + 60)
+	})
+	u.targetLabel = widget.NewLabel("")
 	u.delayEntry = widget.NewEntry()
 	u.delayEntry.SetText("0")
+	u.delayEntry.Validator = func(s string) error {
+		if _, err := parseDelay(s); err != nil {
+			return err
+		}
+		return nil
+	}
 	u.clickCheck = widget.NewCheck("오픈 시각에 지금 마우스 위치를 한 번 클릭", nil)
 	u.clickCheck.SetChecked(true)
 	u.syncBtn = widget.NewButton("시각 다시 맞추기", u.startSync)
@@ -123,7 +161,9 @@ func newUI() *ui {
 func (u *ui) layout() fyne.CanvasObject {
 	form := widget.NewForm(
 		widget.NewFormItem("주소", u.urlEntry),
-		widget.NewFormItem("오픈 시각", u.targetEntry),
+		widget.NewFormItem("오픈 시:분:초", container.NewGridWithColumns(3, u.hourSel, u.minSel, u.secSel)),
+		widget.NewFormItem("", container.NewHBox(u.nextHourBtn, u.practiceBtn)),
+		widget.NewFormItem("", u.targetLabel),
 		widget.NewFormItem("클릭 지연(ms)", u.delayEntry),
 	)
 	return container.NewVBox(
@@ -158,6 +198,12 @@ func (u *ui) refresh() {
 	u.mu.Lock()
 	c, armed, click, clicked, targetAt := u.clock, u.armed, u.click, u.clicked, u.targetAt
 	u.mu.Unlock()
+	if armed {
+		u.showTarget(targetAt, u.serverNow())
+	} else if tod, ok := u.selectedTOD(); ok {
+		serverNow := u.serverNow()
+		u.showTarget(clock.NextKST(tod, serverNow), serverNow)
+	}
 	if c == nil || !c.Valid() {
 		return
 	}
@@ -180,7 +226,7 @@ func (u *ui) refresh() {
 				col = red
 			}
 			if click && left <= 30 && ownAppFront() {
-				text += "  ⚠ 브라우저를 클릭해 앞으로!"
+				text += "  (브라우저를 클릭해 앞으로!)"
 				col = red
 			}
 			for _, mark := range []int{10, 3, 2, 1} {
@@ -196,6 +242,70 @@ func (u *ui) refresh() {
 	if u.countText.Text != text || u.countText.Color != col {
 		u.countText.Text, u.countText.Color = text, col
 		u.countText.Refresh()
+	}
+}
+
+// serverNow is the server's time once synced, this computer's time before.
+func (u *ui) serverNow() float64 {
+	u.mu.Lock()
+	c := u.clock
+	u.mu.Unlock()
+	if c != nil && c.Valid() {
+		return clock.Now() + c.Offset()
+	}
+	return clock.Now()
+}
+
+// setTarget puts the KST time of day of epoch `at` into the dropdowns.
+func (u *ui) setTarget(at float64) {
+	t := time.Unix(int64(math.Floor(at)), 0).In(clock.KST)
+	u.hourSel.SetSelected(fmt.Sprintf("%02d", t.Hour()))
+	u.minSel.SetSelected(fmt.Sprintf("%02d", t.Minute()))
+	u.secSel.SetSelected(fmt.Sprintf("%02d", t.Second()))
+}
+
+// selectedTOD is the chosen open time as seconds since midnight.
+func (u *ui) selectedTOD() (float64, bool) {
+	h, err1 := strconv.Atoi(u.hourSel.Selected)
+	m, err2 := strconv.Atoi(u.minSel.Selected)
+	s, err3 := strconv.Atoi(u.secSel.Selected)
+	if err1 != nil || err2 != nil || err3 != nil {
+		return 0, false
+	}
+	return float64(h*3600 + m*60 + s), true
+}
+
+func parseDelay(s string) (float64, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, nil
+	}
+	d, err := strconv.ParseFloat(s, 64)
+	if err != nil || d < 0 || d > 10000 {
+		return 0, fmt.Errorf("0~10000 사이 숫자(ms)로 써 주세요")
+	}
+	return d, nil
+}
+
+// showTarget writes which day the open time falls on and how far away it is.
+func (u *ui) showTarget(at, serverNow float64) {
+	day := "오늘"
+	if time.Unix(int64(at), 0).In(clock.KST).YearDay() != time.Unix(int64(serverNow), 0).In(clock.KST).YearDay() {
+		day = "내일"
+	}
+	left := int(math.Max(0, at-serverNow))
+	var until string
+	switch {
+	case left >= 3600:
+		until = fmt.Sprintf("%d시간 %d분 뒤", left/3600, left%3600/60)
+	case left >= 60:
+		until = fmt.Sprintf("%d분 %d초 뒤", left/60, left%60)
+	default:
+		until = fmt.Sprintf("%d초 뒤", left)
+	}
+	text := fmt.Sprintf("→ %s %s  (%s)", day, clock.FmtKST(at, 0), until)
+	if u.targetLabel.Text != text {
+		u.targetLabel.SetText(text)
 	}
 }
 
@@ -269,17 +379,15 @@ func (u *ui) arm() {
 		u.addLog("서버 시각을 아직 못 맞췄습니다.")
 		return
 	}
-	tod, err := clock.ParseTOD(u.targetEntry.Text)
-	if err != nil {
-		u.addLog(err.Error())
+	tod, ok := u.selectedTOD()
+	if !ok {
+		u.addLog("오픈 시각의 시·분·초를 모두 고르세요.")
 		return
 	}
-	delay := 0.0
-	if s := strings.TrimSpace(u.delayEntry.Text); s != "" {
-		if delay, err = strconv.ParseFloat(s, 64); err != nil || delay < 0 || delay > 10000 {
-			u.addLog("클릭 지연은 0~10000 사이 숫자(ms)로 써 주세요.")
-			return
-		}
+	delay, err := parseDelay(u.delayEntry.Text)
+	if err != nil {
+		u.addLog("클릭 지연: " + err.Error())
+		return
 	}
 	click := u.clickCheck.Checked
 	if click {
@@ -325,7 +433,7 @@ func (u *ui) disarm() {
 }
 
 func (u *ui) setInputsEnabled(on bool) {
-	for _, w := range []fyne.Disableable{u.urlEntry, u.targetEntry, u.delayEntry, u.clickCheck, u.syncBtn} {
+	for _, w := range []fyne.Disableable{u.urlEntry, u.hourSel, u.minSel, u.secSel, u.nextHourBtn, u.practiceBtn, u.delayEntry, u.clickCheck, u.syncBtn} {
 		if on {
 			w.Enable()
 		} else {
